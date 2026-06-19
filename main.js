@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GeoFMC
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Flight Management Computer for GeoFS
+// @version      2.0
+// @description  Flight Management Computer for GeoFS with boarding simulation
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
 // @grant        none
@@ -28,30 +28,35 @@
         return date.toUTCString().slice(17, 22);
     }
 
-    function pad(str, len) {
-        return String(str).padStart(len, ' ');
-    }
-
     // ================= STATE =================
     let currentPage = 0;
-    const PAGES = ["PROGRESS", "LEGS", "PERF", "FUEL"];
+    const PAGES = ["PROGRESS", "LEGS", "PERF", "FUEL", "BOARD"];
 
-    // Fuel state (user-editable)
+    // Fuel state
     let fuelLbs       = 20000;
-    let fuelBurnRate  = 5000;  // lbs/hr default, editable
+    let fuelBurnRate  = 5000;
     let fuelEditMode  = false;
-    let fuelEditField = null;  // "load" | "burn"
+    let fuelEditField = null;
     let fuelInputBuf  = "";
 
     // Perf state
     let perfEditMode  = false;
-    let perfEditField = null;  // "v1"|"vr"|"v2"|"vapp"|"cruise"
+    let perfEditField = null;
     let perfInputBuf  = "";
     let vSpeeds = { v1: 145, vr: 152, v2: 158, vapp: 135, cruise: 280 };
 
-    // Track session start for fuel burn
-    let sessionStart  = Date.now();
-    let lastAltFt     = null;
+    // Boarding state
+    let boardingEditMode    = false;
+    let boardingInputBuf    = "";
+    let boardingTotal       = 0;      // total pax to board
+    let boardingBoarded     = 0;      // pax currently boarded
+    let boardingActive      = false;  // is boarding in progress
+    let boardingInterval    = null;   // setInterval handle
+    let boardingDeboarding  = false;  // true = deboard mode
+    let boardingComplete    = false;  // boarding finished flag
+    let boardingStartTime   = null;
+
+    let sessionStart = Date.now();
 
     // ================= STYLE =================
     if (!document.getElementById("fmcStyle")) {
@@ -77,7 +82,7 @@
                 margin-bottom: 6px; padding-bottom: 4px;
                 border-bottom: 1px solid #1e3a1e;
             }
-            .fmc-nav { display: flex; gap: 4px; margin-top: 8px; }
+            .fmc-nav { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
             .fmc-nav-btn {
                 flex: 1; padding: 5px 0; font-size: 10px; font-weight: bold;
                 letter-spacing: 1px; cursor: pointer; border: none; border-radius: 3px;
@@ -92,6 +97,16 @@
                 border: 1px solid #2a5a2a; border-radius: 2px; margin-left: 4px;
             }
             .fmc-input-btn:hover { background: #2a4a2a; }
+            .fmc-action-btn {
+                display: inline-block; padding: 3px 8px; font-size: 11px; font-weight: bold;
+                cursor: pointer; border-radius: 3px; border: 1px solid #2a5a2a;
+                background: #1a3a1a; color: #00e676; margin: 2px 2px 0 0;
+            }
+            .fmc-action-btn:hover { background: #2a4a2a; }
+            .fmc-action-btn.stop  { color: #ff4444; border-color: #5a2a2a; background: #3a1a1a; }
+            .fmc-action-btn.stop:hover { background: #4a2020; }
+            .fmc-action-btn.deboard { color: #ffb300; border-color: #5a4a2a; background: #3a2a1a; }
+            .fmc-action-btn.deboard:hover { background: #4a3a1a; }
             .fmc-kbd-row { display: flex; gap: 3px; margin-top: 4px; }
             .fmc-kbd {
                 flex: 1; padding: 4px 0; font-size: 11px; font-weight: bold;
@@ -111,6 +126,14 @@
             .fmc-alert {
                 text-align: center; font-size: 13px; font-weight: bold;
                 padding: 4px 0; animation: fmcblink 1s step-end infinite;
+            }
+            .fmc-pax-bar-bg {
+                width: 100%; height: 10px; background: #0f2a0f;
+                border-radius: 3px; overflow: hidden; margin: 4px 0 6px;
+            }
+            .fmc-pax-bar-fill {
+                height: 100%; border-radius: 3px;
+                transition: width 0.4s ease;
             }
         `;
         document.head.appendChild(s);
@@ -231,6 +254,8 @@
         perfEditMode = false;
         perfEditField = null;
         perfInputBuf = "";
+        boardingEditMode = false;
+        boardingInputBuf = "";
         document.getElementById("fmcKeyboard").style.display = "none";
     }
 
@@ -261,10 +286,80 @@
     function updateScratch() {
         const el = document.getElementById("fmcScratch");
         if (!el) return;
-        const buf = fuelEditMode ? fuelInputBuf : perfInputBuf;
+        let buf = "";
+        if (fuelEditMode)    buf = fuelInputBuf;
+        if (perfEditMode)    buf = perfInputBuf;
+        if (boardingEditMode) buf = boardingInputBuf;
         el.innerHTML = buf
             ? `<span style="color:#ffb300;">${buf}</span><span class="fmc-cursor">_</span>`
             : `<span class="fmc-cursor">_</span>`;
+    }
+
+    // ================= BOARDING LOGIC =================
+
+    function startBoarding() {
+        if (boardingTotal <= 0 || boardingActive) return;
+        boardingActive     = true;
+        boardingDeboarding = false;
+        boardingComplete   = false;
+        boardingStartTime  = Date.now();
+
+        boardingInterval = setInterval(() => {
+            if (boardingBoarded < boardingTotal) {
+                boardingBoarded++;
+            } else {
+                clearInterval(boardingInterval);
+                boardingInterval = null;
+                boardingActive   = false;
+                boardingComplete = true;
+            }
+        }, 5000); // 1 pax every 5 seconds
+    }
+
+    function startDeboarding() {
+        if (boardingBoarded <= 0 || boardingActive) return;
+        boardingActive     = true;
+        boardingDeboarding = true;
+        boardingComplete   = false;
+
+        boardingInterval = setInterval(() => {
+            if (boardingBoarded > 0) {
+                boardingBoarded--;
+            } else {
+                clearInterval(boardingInterval);
+                boardingInterval = null;
+                boardingActive   = false;
+                boardingBoarded  = 0;
+                boardingTotal    = 0;
+            }
+        }, 5000);
+    }
+
+    function stopBoarding() {
+        if (boardingInterval) {
+            clearInterval(boardingInterval);
+            boardingInterval = null;
+        }
+        boardingActive = false;
+    }
+
+    function resetBoarding() {
+        stopBoarding();
+        boardingBoarded  = 0;
+        boardingTotal    = 0;
+        boardingComplete = false;
+        boardingDeboarding = false;
+    }
+
+    function boardingETA() {
+        if (!boardingActive) return "--:--";
+        const remaining = boardingDeboarding
+            ? boardingBoarded
+            : boardingTotal - boardingBoarded;
+        const seconds = remaining * 5;
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        return m + "m " + String(s).padStart(2, "0") + "s";
     }
 
     // ================= PAGES =================
@@ -295,8 +390,6 @@
 
         let html = "";
         const max = Math.min(fp.length, idx + 6);
-
-        // Running cumulative distance from current position
         let cumDist = nm(pos[0], pos[1], fp[idx].lat, fp[idx].lon);
 
         for (let i = idx; i < max; i++) {
@@ -341,8 +434,6 @@
 
     function renderPerf(data) {
         const { gs, altFt } = data;
-
-        // Mach approximation: TAS ≈ GS for sim, speed of sound ~661kt at sea level, decreases ~2kt/1000ft
         const sos  = 661 - (altFt / 1000) * 2;
         const mach = gs > 0 ? (gs / sos).toFixed(3) : "-.---";
 
@@ -386,7 +477,7 @@
 
     function renderFuel(data) {
         const { gs } = data;
-        const elapsed   = (Date.now() - sessionStart) / 3600000; // hours
+        const elapsed   = (Date.now() - sessionStart) / 3600000;
         const burned    = fuelBurnRate * elapsed;
         const remaining = Math.max(0, fuelLbs - burned);
         const endurance = fuelBurnRate > 0 ? remaining / fuelBurnRate : 0;
@@ -421,6 +512,105 @@
         `;
     }
 
+    function renderBoarding() {
+        const pct = boardingTotal > 0
+            ? Math.round((boardingBoarded / boardingTotal) * 100)
+            : 0;
+
+        // Progress bar color
+        const barColor = boardingComplete
+            ? "#00e676"
+            : boardingDeboarding
+                ? "#ffb300"
+                : "#00cfff";
+
+        // Status text
+        let statusText = "READY";
+        let statusCls  = "cyan";
+        if (boardingActive && !boardingDeboarding) { statusText = "BOARDING"; statusCls = "green"; }
+        if (boardingActive && boardingDeboarding)  { statusText = "DEBOARDING"; statusCls = "amber"; }
+        if (boardingComplete)                       { statusText = "COMPLETE"; statusCls = "green"; }
+        if (!boardingActive && !boardingComplete && boardingBoarded > 0 && !boardingDeboarding)
+            { statusText = "PAUSED"; statusCls = "amber"; }
+
+        // Total duration estimate
+        const totalMinutes = boardingTotal > 0
+            ? Math.floor((boardingTotal * 5) / 60)
+            : 0;
+        const totalSeconds = boardingTotal > 0
+            ? (boardingTotal * 5) % 60
+            : 0;
+
+        // Buttons
+        let buttons = "";
+        if (!boardingActive && boardingTotal === 0) {
+            // No pax set yet — show set button
+            buttons = `<span class="fmc-input-btn" id="fmcBoardSetBtn">[SET PAX]</span>`;
+        } else if (!boardingActive && !boardingComplete && boardingBoarded < boardingTotal) {
+            // Ready to board or paused
+            buttons = `
+                <button class="fmc-action-btn" id="fmcBoardStart">▶ BOARD</button>
+                <button class="fmc-action-btn stop" id="fmcBoardReset">✕ RESET</button>
+                <span class="fmc-input-btn" id="fmcBoardSetBtn">[SET PAX]</span>
+            `;
+        } else if (boardingActive && !boardingDeboarding) {
+            // Currently boarding
+            buttons = `
+                <button class="fmc-action-btn stop" id="fmcBoardStop">⏸ PAUSE</button>
+            `;
+        } else if (boardingComplete || (!boardingActive && boardingBoarded === boardingTotal && boardingTotal > 0)) {
+            // Boarding done — offer deboard
+            buttons = `
+                <button class="fmc-action-btn deboard" id="fmcBoardDeboard">▼ DEBOARD</button>
+                <button class="fmc-action-btn stop" id="fmcBoardReset">✕ RESET</button>
+            `;
+        } else if (boardingActive && boardingDeboarding) {
+            // Deboarding in progress
+            buttons = `
+                <button class="fmc-action-btn stop" id="fmcBoardStop">⏸ PAUSE</button>
+            `;
+        } else if (!boardingActive && boardingBoarded > 0) {
+            // Paused mid-deboard
+            buttons = `
+                <button class="fmc-action-btn deboard" id="fmcBoardDeboard">▼ DEBOARD</button>
+                <button class="fmc-action-btn stop" id="fmcBoardReset">✕ RESET</button>
+            `;
+        }
+
+        return `
+            <div class="fmc-label">PAX STATUS</div>
+            <div class="fmc-row" style="margin-bottom:2px; align-items:center;">
+                <span class="fmc-value white" style="font-size:20px;">${boardingBoarded}</span>
+                <span class="fmc-value" style="font-size:12px; color:#5aafff;">/ ${boardingTotal} PAX</span>
+                <span class="fmc-value ${statusCls}" style="font-size:11px;">${statusText}</span>
+            </div>
+
+            <div class="fmc-pax-bar-bg">
+                <div class="fmc-pax-bar-fill" style="width:${pct}%; background:${barColor};"></div>
+            </div>
+
+            <div class="fmc-row" style="margin-bottom:4px;">
+                <span class="fmc-label">${pct}% BOARDED</span>
+                <span class="fmc-label">${boardingBoarded} SEATED</span>
+            </div>
+
+            ${divider()}
+
+            ${boardingTotal > 0 ? `
+                ${rowSplit("TOTAL TIME", totalMinutes + "m " + String(totalSeconds).padStart(2,"0") + "s", "@ 1 PAX/5S", "amber", "")}
+                ${boardingActive ? rowSplit("ETA DONE", boardingETA(), "REMAINING", "cyan", "") : ""}
+            ` : `
+                <div class="fmc-value" style="color:#5aafff; font-size:11px; margin:6px 0;">
+                    Set number of passengers to begin boarding simulation.
+                </div>
+            `}
+
+            ${divider()}
+
+            <div style="margin-top:4px;">${buttons}</div>
+        `;
+    }
+
     // ================= RENDER =================
     function renderPage() {
         const content   = document.getElementById("fmcContent");
@@ -428,6 +618,13 @@
         if (!content || !pageTitle) return;
 
         pageTitle.textContent = PAGES[currentPage];
+
+        // Boarding page doesn't need GeoFS flight data
+        if (currentPage === 4) {
+            content.innerHTML = renderBoarding();
+            bindBoardingButtons();
+            return;
+        }
 
         try {
             const fp     = geofs.flightPlan.waypointArray;
@@ -465,12 +662,9 @@
                 case 3: content.innerHTML = renderFuel(data);     break;
             }
 
-            // Bind PERF edit buttons
             content.querySelectorAll(".fmc-input-btn[data-field]").forEach(b => {
                 b.onclick = () => startPerfEdit(b.dataset.field);
             });
-
-            // Bind FUEL edit buttons
             content.querySelectorAll(".fmc-input-btn[data-fuel-field]").forEach(b => {
                 b.onclick = () => startFuelEdit(b.dataset.fuelField);
             });
@@ -479,6 +673,23 @@
             content.innerHTML = `<span style="color:red;">FMC ERROR</span>`;
             console.error("[GeoFMC]", err);
         }
+    }
+
+    function bindBoardingButtons() {
+        const content = document.getElementById("fmcContent");
+        if (!content) return;
+
+        const setBtn     = content.querySelector("#fmcBoardSetBtn");
+        const startBtn   = content.querySelector("#fmcBoardStart");
+        const stopBtn    = content.querySelector("#fmcBoardStop");
+        const resetBtn   = content.querySelector("#fmcBoardReset");
+        const deboardBtn = content.querySelector("#fmcBoardDeboard");
+
+        if (setBtn)     setBtn.onclick     = () => startBoardingEdit();
+        if (startBtn)   startBtn.onclick   = () => { startBoarding(); renderPage(); };
+        if (stopBtn)    stopBtn.onclick    = () => { stopBoarding(); renderPage(); };
+        if (resetBtn)   resetBtn.onclick   = () => { resetBoarding(); renderPage(); };
+        if (deboardBtn) deboardBtn.onclick = () => { startDeboarding(); renderPage(); };
     }
 
     // ================= EDIT MODES =================
@@ -496,7 +707,7 @@
                 if (!isNaN(val) && val > 0) {
                     if (fuelEditField === "load") {
                         fuelLbs = val;
-                        sessionStart = Date.now(); // reset burn timer on refuel
+                        sessionStart = Date.now();
                     } else if (fuelEditField === "burn") {
                         fuelBurnRate = val;
                     }
@@ -529,10 +740,35 @@
         updateScratch();
     }
 
+    function startBoardingEdit() {
+        exitEditMode();
+        boardingEditMode = true;
+        boardingInputBuf = "";
+
+        showKeyboard(
+            (digit) => { boardingInputBuf += digit; },
+            ()      => { boardingInputBuf = boardingInputBuf.slice(0, -1); },
+            ()      => {
+                const val = parseInt(boardingInputBuf, 10);
+                if (!isNaN(val) && val > 0) {
+                    // Reset boarding state when setting new pax count
+                    stopBoarding();
+                    boardingBoarded  = 0;
+                    boardingTotal    = val;
+                    boardingComplete = false;
+                    boardingDeboarding = false;
+                }
+                exitEditMode();
+                renderPage();
+            }
+        );
+        updateScratch();
+    }
+
     // ================= LOOP =================
     setInterval(() => {
         if (panel.style.display === "none") return;
-        if (fuelEditMode || perfEditMode) return; // don't redraw while user is typing
+        if (fuelEditMode || perfEditMode || boardingEditMode) return;
         renderPage();
     }, 1000);
 
