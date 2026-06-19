@@ -1,3 +1,14 @@
+// ==UserScript==
+// @name         GeoFMC
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Flight Management Computer for GeoFS
+// @match        https://www.geo-fs.com/geofs.php*
+// @match        https://*.geo-fs.com/geofs.php*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
 (function () {
 
     // ================= DISTANCE =================
