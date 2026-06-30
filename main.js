@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GeoFMC
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Flight Management Computer for GeoFS with boarding simulation
+// @version      2.1
+// @description  Flight Management Computer for GeoFS with boarding, ground ops, fueling, and pushback simulation
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
 // @grant        none
@@ -30,7 +30,7 @@
 
     // ================= STATE =================
     let currentPage = 0;
-    const PAGES = ["PROGRESS", "LEGS", "PERF", "FUEL", "BOARD"];
+    const PAGES = ["PROGRESS", "LEGS", "PERF", "FUEL", "GROUND", "PUSH", "BOARD"];
 
     // Fuel state
     let fuelLbs       = 20000;
@@ -38,6 +38,14 @@
     let fuelEditMode  = false;
     let fuelEditField = null;
     let fuelInputBuf  = "";
+
+    // Fuel truck state
+    let fuelTruckTarget   = null;   // target lbs
+    let fuelTruckActive   = false;
+    let fuelTruckInterval = null;
+    let fuelTruckRate     = 1500;   // lbs per 5s tick
+    let fuelTruckEditMode = false;
+    let fuelTruckInputBuf = "";
 
     // Perf state
     let perfEditMode  = false;
@@ -56,6 +64,36 @@
     let boardingComplete    = false;  // boarding finished flag
     let boardingStartTime   = null;
 
+    // Cargo state
+    let cargoTarget    = 0;     // lbs target
+    let cargoLoaded    = 0;
+    let cargoActive    = false;
+    let cargoInterval  = null;
+    let cargoRate      = 800;   // lbs per 5s tick
+    let cargoEditMode  = false;
+    let cargoInputBuf  = "";
+
+    // Catering state
+    let cateringTarget   = 4;   // carts needed
+    let cateringLoaded   = 0;
+    let cateringActive   = false;
+    let cateringInterval = null;
+    let cateringEditMode = false;
+    let cateringInputBuf = "";
+
+    // Pushback / engine start checklist
+    let pushChecklist = [
+        { label: "PARKING BRAKE SET",     checked: false },
+        { label: "PUSHBACK CLEARANCE",    checked: false },
+        { label: "TUG CONNECTED",         checked: false },
+        { label: "DOORS CLOSED",          checked: false },
+        { label: "BEACON ON",             checked: false },
+        { label: "ENGINE 1 START",        checked: false },
+        { label: "ENGINE 2 START",        checked: false },
+        { label: "TUG DISCONNECTED",      checked: false },
+        { label: "BRAKE RELEASED",        checked: false },
+    ];
+
     let sessionStart = Date.now();
 
     // ================= STYLE =================
@@ -66,7 +104,7 @@
             @keyframes fmcblink { 0%,100%{opacity:1} 50%{opacity:0} }
             #fmcPanel * { box-sizing: border-box; }
             #fmcPanel { font-family: 'Courier New', Courier, monospace; }
-            .fmc-screen { background: #0a1a0a; border-radius: 4px; padding: 8px; min-height: 260px; }
+            .fmc-screen { background: #0a1a0a; border-radius: 4px; padding: 8px; min-height: 260px; max-height: 380px; overflow-y: auto; }
             .fmc-row { display: flex; justify-content: space-between; font-size: 12px; line-height: 1.55; }
             .fmc-label { color: #5aafff; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
             .fmc-value { color: #e8e8e8; }
@@ -84,7 +122,7 @@
             }
             .fmc-nav { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
             .fmc-nav-btn {
-                flex: 1; padding: 5px 0; font-size: 10px; font-weight: bold;
+                flex: 1; min-width: 56px; padding: 5px 0; font-size: 10px; font-weight: bold;
                 letter-spacing: 1px; cursor: pointer; border: none; border-radius: 3px;
                 background: #1a2a1a; color: #5aafff; border: 1px solid #2a4a2a;
                 transition: background 0.15s;
@@ -134,6 +172,18 @@
             .fmc-pax-bar-fill {
                 height: 100%; border-radius: 3px;
                 transition: width 0.4s ease;
+            }
+            .fmc-checklist-item {
+                display: flex; align-items: center; gap: 6px;
+                padding: 4px 2px; border-bottom: 1px solid #0f1f0f;
+                cursor: pointer; font-size: 12px;
+            }
+            .fmc-checklist-item:hover { background: #0f1f0f; }
+            .fmc-checkbox {
+                width: 14px; height: 14px; border: 1px solid #2a5a2a;
+                border-radius: 2px; flex: 0 0 auto;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 10px; color: #00e676; background: #001800;
             }
         `;
         document.head.appendChild(s);
@@ -247,15 +297,27 @@
         return `<hr class="fmc-divider">`;
     }
 
+    function progressBar(pct, color) {
+        const barLen = 16;
+        const filled = Math.round((pct / 100) * barLen);
+        return `<span style="color:${color};">${"█".repeat(filled)}${"░".repeat(barLen - filled)}</span>`;
+    }
+
     function exitEditMode() {
         fuelEditMode = false;
         fuelEditField = null;
         fuelInputBuf = "";
+        fuelTruckEditMode = false;
+        fuelTruckInputBuf = "";
         perfEditMode = false;
         perfEditField = null;
         perfInputBuf = "";
         boardingEditMode = false;
         boardingInputBuf = "";
+        cargoEditMode = false;
+        cargoInputBuf = "";
+        cateringEditMode = false;
+        cateringInputBuf = "";
         document.getElementById("fmcKeyboard").style.display = "none";
     }
 
@@ -287,9 +349,12 @@
         const el = document.getElementById("fmcScratch");
         if (!el) return;
         let buf = "";
-        if (fuelEditMode)    buf = fuelInputBuf;
-        if (perfEditMode)    buf = perfInputBuf;
-        if (boardingEditMode) buf = boardingInputBuf;
+        if (fuelEditMode)      buf = fuelInputBuf;
+        if (fuelTruckEditMode) buf = fuelTruckInputBuf;
+        if (perfEditMode)      buf = perfInputBuf;
+        if (boardingEditMode)  buf = boardingInputBuf;
+        if (cargoEditMode)     buf = cargoInputBuf;
+        if (cateringEditMode)  buf = cateringInputBuf;
         el.innerHTML = buf
             ? `<span style="color:#ffb300;">${buf}</span><span class="fmc-cursor">_</span>`
             : `<span class="fmc-cursor">_</span>`;
@@ -360,6 +425,86 @@
         const m = Math.floor(seconds / 60);
         const s = seconds % 60;
         return m + "m " + String(s).padStart(2, "0") + "s";
+    }
+
+    // ================= CARGO LOGIC =================
+
+    function startCargo() {
+        if (cargoTarget <= 0 || cargoActive) return;
+        cargoActive = true;
+        cargoInterval = setInterval(() => {
+            if (cargoLoaded < cargoTarget) {
+                cargoLoaded = Math.min(cargoTarget, cargoLoaded + cargoRate);
+            } else {
+                clearInterval(cargoInterval);
+                cargoInterval = null;
+                cargoActive = false;
+            }
+        }, 5000);
+    }
+
+    function stopCargo() {
+        if (cargoInterval) { clearInterval(cargoInterval); cargoInterval = null; }
+        cargoActive = false;
+    }
+
+    function resetCargo() {
+        stopCargo();
+        cargoLoaded = 0;
+        cargoTarget = 0;
+    }
+
+    // ================= CATERING LOGIC =================
+
+    function startCatering() {
+        if (cateringActive || cateringLoaded >= cateringTarget) return;
+        cateringActive = true;
+        cateringInterval = setInterval(() => {
+            if (cateringLoaded < cateringTarget) {
+                cateringLoaded++;
+            } else {
+                clearInterval(cateringInterval);
+                cateringInterval = null;
+                cateringActive = false;
+            }
+        }, 8000); // 1 cart every 8 seconds
+    }
+
+    function stopCatering() {
+        if (cateringInterval) { clearInterval(cateringInterval); cateringInterval = null; }
+        cateringActive = false;
+    }
+
+    function resetCatering() {
+        stopCatering();
+        cateringLoaded = 0;
+    }
+
+    // ================= FUEL TRUCK LOGIC =================
+
+    function startFuelTruck() {
+        if (!fuelTruckTarget || fuelTruckActive) return;
+        fuelTruckActive = true;
+        fuelTruckInterval = setInterval(() => {
+            if (fuelLbs < fuelTruckTarget) {
+                fuelLbs = Math.min(fuelTruckTarget, fuelLbs + fuelTruckRate);
+                sessionStart = Date.now(); // reset burn baseline as truck tops off
+            } else {
+                clearInterval(fuelTruckInterval);
+                fuelTruckInterval = null;
+                fuelTruckActive = false;
+            }
+        }, 5000);
+    }
+
+    function stopFuelTruck() {
+        if (fuelTruckInterval) { clearInterval(fuelTruckInterval); fuelTruckInterval = null; }
+        fuelTruckActive = false;
+    }
+
+    function resetFuelTruck() {
+        stopFuelTruck();
+        fuelTruckTarget = null;
     }
 
     // ================= PAGES =================
@@ -484,15 +629,50 @@
         const range     = gs > 1 ? endurance * gs : 0;
         const pctLeft   = fuelLbs > 0 ? (remaining / fuelLbs) * 100 : 0;
 
-        const barLen  = 16;
-        const filled  = Math.round((pctLeft / 100) * barLen);
         const barCol  = pctLeft > 50 ? "#00e676" : pctLeft > 20 ? "#ffb300" : "#ff4444";
-        const bar     = `<span style="color:${barCol};">${"█".repeat(filled)}${"░".repeat(barLen - filled)}</span>`;
+        const bar     = progressBar(pctLeft, barCol);
 
         const fuelColor = pctLeft > 50 ? "green" : pctLeft > 20 ? "amber" : "red";
 
         const editBtn = (field, label) =>
             `<span class="fmc-input-btn" data-fuel-field="${field}">[${label}]</span>`;
+
+        // Fuel truck section
+        let truckSection = "";
+        if (fuelTruckTarget) {
+            const truckPct = Math.min(100, (fuelLbs / fuelTruckTarget) * 100);
+            const truckColor = fuelLbs >= fuelTruckTarget ? "#00e676" : "#00cfff";
+            const status = fuelTruckActive ? "FUELING" : (fuelLbs >= fuelTruckTarget ? "TARGET REACHED" : "PAUSED");
+            let truckBtns = "";
+            if (fuelLbs >= fuelTruckTarget) {
+                truckBtns = `<span class="fmc-input-btn" id="fmcTruckReset">[RESET]</span>`;
+            } else if (fuelTruckActive) {
+                truckBtns = `<button class="fmc-action-btn stop" id="fmcTruckStop">⏸ PAUSE</button>`;
+            } else {
+                truckBtns = `
+                    <button class="fmc-action-btn" id="fmcTruckStart">▶ FUEL</button>
+                    <button class="fmc-action-btn stop" id="fmcTruckReset2">✕ RESET</button>
+                `;
+            }
+            truckSection = `
+                ${divider()}
+                <div class="fmc-label">FUEL TRUCK — TARGET ${fuelTruckTarget.toFixed(0)} LBS</div>
+                <div style="font-size:11px;letter-spacing:0;margin:2px 0 4px;">${progressBar(truckPct, truckColor)}</div>
+                <div class="fmc-row" style="margin-bottom:4px;">
+                    <span class="fmc-value ${fuelTruckActive ? "cyan" : "amber"}">${status}</span>
+                    <span class="fmc-value">${truckPct.toFixed(0)}%</span>
+                </div>
+                <div>${truckBtns}</div>
+            `;
+        } else {
+            truckSection = `
+                ${divider()}
+                <div class="fmc-label">FUEL TRUCK</div>
+                <div class="fmc-value" style="color:#5aafff; font-size:11px; margin:4px 0;">
+                    No fuel truck called. ${editBtn("trucktarget", "CALL TRUCK")}
+                </div>
+            `;
+        }
 
         return `
             <div class="fmc-label">FUEL QUANTITY</div>
@@ -505,10 +685,104 @@
             ${rowSplit("BURNED", burned.toFixed(0) + " LBS", elapsed.toFixed(1) + " HRS", "amber", "amber")}
             ${rowSplit("ENDURANCE", endurance.toFixed(1) + " HRS", range.toFixed(0) + " NM")}
             ${divider()}
-            <div class="fmc-label">FUEL LOAD ${editBtn("load", "SET")}</div>
+            <div class="fmc-label">FUEL LOAD (MANUAL) ${editBtn("load", "SET")}</div>
             <div class="fmc-value white">${fuelLbs.toFixed(0)} LBS</div>
             <div class="fmc-label" style="margin-top:4px;">BURN RATE ${editBtn("burn", "SET")}</div>
             <div class="fmc-value white">${fuelBurnRate.toFixed(0)} LBS/HR</div>
+            ${truckSection}
+        `;
+    }
+
+    function renderGround() {
+        const cargoPct    = cargoTarget > 0 ? Math.round((cargoLoaded / cargoTarget) * 100) : 0;
+        const cateringPct = cateringTarget > 0 ? Math.round((cateringLoaded / cateringTarget) * 100) : 0;
+
+        // Cargo buttons
+        let cargoBtns = "";
+        if (cargoTarget === 0) {
+            cargoBtns = `<span class="fmc-input-btn" id="fmcCargoSetBtn">[SET LBS]</span>`;
+        } else if (cargoLoaded >= cargoTarget) {
+            cargoBtns = `<span class="fmc-input-btn" id="fmcCargoReset">[RESET]</span>`;
+        } else if (cargoActive) {
+            cargoBtns = `<button class="fmc-action-btn stop" id="fmcCargoStop">⏸ PAUSE</button>`;
+        } else {
+            cargoBtns = `
+                <button class="fmc-action-btn" id="fmcCargoStart">▶ LOAD</button>
+                <button class="fmc-action-btn stop" id="fmcCargoReset2">✕ RESET</button>
+                <span class="fmc-input-btn" id="fmcCargoSetBtn">[SET LBS]</span>
+            `;
+        }
+
+        // Catering buttons
+        let cateringBtns = "";
+        if (cateringLoaded >= cateringTarget) {
+            cateringBtns = `<span class="fmc-input-btn" id="fmcCateringReset">[RESET]</span>`;
+        } else if (cateringActive) {
+            cateringBtns = `<button class="fmc-action-btn stop" id="fmcCateringStop">⏸ PAUSE</button>`;
+        } else {
+            cateringBtns = `
+                <button class="fmc-action-btn" id="fmcCateringStart">▶ LOAD</button>
+                <button class="fmc-action-btn stop" id="fmcCateringReset2">✕ RESET</button>
+                <span class="fmc-input-btn" id="fmcCateringSetBtn">[SET CARTS]</span>
+            `;
+        }
+
+        return `
+            <div class="fmc-label">CARGO LOADING</div>
+            ${cargoTarget > 0 ? `
+                <div class="fmc-row" style="margin-bottom:2px;">
+                    <span class="fmc-value white">${cargoLoaded.toFixed(0)} / ${cargoTarget.toFixed(0)} LBS</span>
+                    <span class="fmc-value ${cargoLoaded >= cargoTarget ? "green" : "cyan"}">
+                        ${cargoLoaded >= cargoTarget ? "COMPLETE" : (cargoActive ? "LOADING" : "PAUSED")}
+                    </span>
+                </div>
+                <div style="font-size:11px;letter-spacing:0;margin-bottom:6px;">
+                    ${progressBar(cargoPct, cargoLoaded >= cargoTarget ? "#00e676" : "#00cfff")}
+                </div>
+            ` : `<div class="fmc-value" style="color:#5aafff; font-size:11px; margin:4px 0 6px;">No cargo manifest set.</div>`}
+            <div>${cargoBtns}</div>
+
+            ${divider()}
+
+            <div class="fmc-label">CATERING (${cateringTarget} CARTS)</div>
+            <div class="fmc-row" style="margin-bottom:2px;">
+                <span class="fmc-value white">${cateringLoaded} / ${cateringTarget} CARTS</span>
+                <span class="fmc-value ${cateringLoaded >= cateringTarget ? "green" : "cyan"}">
+                    ${cateringLoaded >= cateringTarget ? "COMPLETE" : (cateringActive ? "LOADING" : "PAUSED")}
+                </span>
+            </div>
+            <div style="font-size:11px;letter-spacing:0;margin-bottom:6px;">
+                ${progressBar(cateringPct, cateringLoaded >= cateringTarget ? "#00e676" : "#00cfff")}
+            </div>
+            <div>${cateringBtns}</div>
+        `;
+    }
+
+    function renderPush() {
+        const checkedCount = pushChecklist.filter(i => i.checked).length;
+        const allDone = checkedCount === pushChecklist.length;
+
+        const items = pushChecklist.map((item, i) => `
+            <div class="fmc-checklist-item" data-idx="${i}">
+                <span class="fmc-checkbox">${item.checked ? "✓" : ""}</span>
+                <span class="fmc-value ${item.checked ? "green" : "white"}">${item.label}</span>
+            </div>
+        `).join("");
+
+        return `
+            <div class="fmc-row" style="margin-bottom:4px;">
+                <span class="fmc-label">PUSHBACK / ENGINE START</span>
+                <span class="fmc-value ${allDone ? "green" : "amber"}">${checkedCount}/${pushChecklist.length}</span>
+            </div>
+            ${items}
+            ${divider()}
+            ${allDone
+                ? `<div class="fmc-alert" style="color:#00e676;">✔ READY FOR TAXI</div>`
+                : `<div class="fmc-value" style="color:#5aafff; font-size:11px;">Tap each item to confirm completion.</div>`
+            }
+            <div style="margin-top:6px;">
+                <button class="fmc-action-btn stop" id="fmcPushReset">✕ RESET CHECKLIST</button>
+            </div>
         `;
     }
 
@@ -619,8 +893,18 @@
 
         pageTitle.textContent = PAGES[currentPage];
 
-        // Boarding page doesn't need GeoFS flight data
-        if (currentPage === 4) {
+        // Pages that don't need live GeoFS flight data
+        if (PAGES[currentPage] === "GROUND") {
+            content.innerHTML = renderGround();
+            bindGroundButtons();
+            return;
+        }
+        if (PAGES[currentPage] === "PUSH") {
+            content.innerHTML = renderPush();
+            bindPushButtons();
+            return;
+        }
+        if (PAGES[currentPage] === "BOARD") {
             content.innerHTML = renderBoarding();
             bindBoardingButtons();
             return;
@@ -669,6 +953,8 @@
                 b.onclick = () => startFuelEdit(b.dataset.fuelField);
             });
 
+            if (currentPage === 3) bindFuelTruckButtons();
+
         } catch (err) {
             content.innerHTML = `<span style="color:red;">FMC ERROR</span>`;
             console.error("[GeoFMC]", err);
@@ -692,9 +978,92 @@
         if (deboardBtn) deboardBtn.onclick = () => { startDeboarding(); renderPage(); };
     }
 
+    function bindGroundButtons() {
+        const content = document.getElementById("fmcContent");
+        if (!content) return;
+
+        const cargoSetBtn   = content.querySelector("#fmcCargoSetBtn");
+        const cargoStart    = content.querySelector("#fmcCargoStart");
+        const cargoStop     = content.querySelector("#fmcCargoStop");
+        const cargoReset    = content.querySelector("#fmcCargoReset");
+        const cargoReset2   = content.querySelector("#fmcCargoReset2");
+
+        if (cargoSetBtn) cargoSetBtn.onclick = () => startCargoEdit();
+        if (cargoStart)  cargoStart.onclick  = () => { startCargo(); renderPage(); };
+        if (cargoStop)   cargoStop.onclick   = () => { stopCargo(); renderPage(); };
+        if (cargoReset)  cargoReset.onclick  = () => { resetCargo(); renderPage(); };
+        if (cargoReset2) cargoReset2.onclick = () => { resetCargo(); renderPage(); };
+
+        const cateringSetBtn = content.querySelector("#fmcCateringSetBtn");
+        const cateringStart  = content.querySelector("#fmcCateringStart");
+        const cateringStop   = content.querySelector("#fmcCateringStop");
+        const cateringReset  = content.querySelector("#fmcCateringReset");
+        const cateringReset2 = content.querySelector("#fmcCateringReset2");
+
+        if (cateringSetBtn) cateringSetBtn.onclick = () => startCateringEdit();
+        if (cateringStart)  cateringStart.onclick  = () => { startCatering(); renderPage(); };
+        if (cateringStop)   cateringStop.onclick   = () => { stopCatering(); renderPage(); };
+        if (cateringReset)  cateringReset.onclick  = () => { resetCatering(); renderPage(); };
+        if (cateringReset2) cateringReset2.onclick = () => { resetCatering(); renderPage(); };
+    }
+
+    function bindPushButtons() {
+        const content = document.getElementById("fmcContent");
+        if (!content) return;
+
+        content.querySelectorAll(".fmc-checklist-item").forEach(el => {
+            el.onclick = () => {
+                const idx = parseInt(el.dataset.idx, 10);
+                pushChecklist[idx].checked = !pushChecklist[idx].checked;
+                renderPage();
+            };
+        });
+
+        const resetBtn = content.querySelector("#fmcPushReset");
+        if (resetBtn) resetBtn.onclick = () => {
+            pushChecklist.forEach(i => i.checked = false);
+            renderPage();
+        };
+    }
+
+    function bindFuelTruckButtons() {
+        const content = document.getElementById("fmcContent");
+        if (!content) return;
+
+        const start  = content.querySelector("#fmcTruckStart");
+        const stop   = content.querySelector("#fmcTruckStop");
+        const reset  = content.querySelector("#fmcTruckReset");
+        const reset2 = content.querySelector("#fmcTruckReset2");
+
+        if (start)  start.onclick  = () => { startFuelTruck(); renderPage(); };
+        if (stop)   stop.onclick   = () => { stopFuelTruck(); renderPage(); };
+        if (reset)  reset.onclick  = () => { resetFuelTruck(); renderPage(); };
+        if (reset2) reset2.onclick = () => { resetFuelTruck(); renderPage(); };
+    }
+
     // ================= EDIT MODES =================
     function startFuelEdit(field) {
         exitEditMode();
+
+        if (field === "trucktarget") {
+            fuelTruckEditMode = true;
+            fuelTruckInputBuf = "";
+            showKeyboard(
+                (digit) => { fuelTruckInputBuf += digit; },
+                ()      => { fuelTruckInputBuf = fuelTruckInputBuf.slice(0, -1); },
+                ()      => {
+                    const val = parseFloat(fuelTruckInputBuf);
+                    if (!isNaN(val) && val > 0) {
+                        fuelTruckTarget = val;
+                    }
+                    exitEditMode();
+                    renderPage();
+                }
+            );
+            updateScratch();
+            return;
+        }
+
         fuelEditMode  = true;
         fuelEditField = field;
         fuelInputBuf  = "";
@@ -765,10 +1134,54 @@
         updateScratch();
     }
 
+    function startCargoEdit() {
+        exitEditMode();
+        cargoEditMode = true;
+        cargoInputBuf = "";
+
+        showKeyboard(
+            (digit) => { cargoInputBuf += digit; },
+            ()      => { cargoInputBuf = cargoInputBuf.slice(0, -1); },
+            ()      => {
+                const val = parseFloat(cargoInputBuf);
+                if (!isNaN(val) && val > 0) {
+                    stopCargo();
+                    cargoLoaded = 0;
+                    cargoTarget = val;
+                }
+                exitEditMode();
+                renderPage();
+            }
+        );
+        updateScratch();
+    }
+
+    function startCateringEdit() {
+        exitEditMode();
+        cateringEditMode = true;
+        cateringInputBuf = "";
+
+        showKeyboard(
+            (digit) => { cateringInputBuf += digit; },
+            ()      => { cateringInputBuf = cateringInputBuf.slice(0, -1); },
+            ()      => {
+                const val = parseInt(cateringInputBuf, 10);
+                if (!isNaN(val) && val > 0) {
+                    stopCatering();
+                    cateringLoaded = 0;
+                    cateringTarget = val;
+                }
+                exitEditMode();
+                renderPage();
+            }
+        );
+        updateScratch();
+    }
+
     // ================= LOOP =================
     setInterval(() => {
         if (panel.style.display === "none") return;
-        if (fuelEditMode || perfEditMode || boardingEditMode) return;
+        if (fuelEditMode || perfEditMode || boardingEditMode || cargoEditMode || cateringEditMode || fuelTruckEditMode) return;
         renderPage();
     }, 1000);
 
